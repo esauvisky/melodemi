@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 import os
-from loguru import logger
 import sys
-from tqdm import tqdm
-import argparse
-import asyncio
-from sys import platform
-import keras
-from keras.models import Sequential
-from keras.layers import LSTM, Dense
+
 import music21
-from keras.callbacks import ModelCheckpoint
 import numpy as np
-import pygame
+from keras.layers import LSTM, Dense, Input, concatenate
+from keras.models import Model
+from keras.utils import to_categorical
+from loguru import logger
+from midi2audio import FluidSynth
+from tqdm import tqdm
+
+SEQUENCE_LENGTH = 16
+BATCH_SIZE = 16
+EPOCHS = 100
+
 
 def setup_logging(level="DEBUG", show_module=False):
     """
@@ -25,115 +27,100 @@ def setup_logging(level="DEBUG", show_module=False):
     log_fmt += u"{time:HH:mm:ss.SSS}]</green> <level>{level: <8}</level> | <level>{message}</level>"
     logger.add(sys.stderr, level=log_level, format=log_fmt, colorize=True, backtrace=True, diagnose=True)
 
-from midi2audio import FluidSynth
 
 def play_midi(midi_file):
-
     #Play MIDI
-    sf2_path = '/usr/share/soundfonts/freepats-general-midi.sf2'  # path to sound font file
+    sf2_path = '/usr/share/soundfonts/freepats-general-midi.sf2' # path to sound font file
     FluidSynth(sound_font=sf2_path).play_midi(midi_file)
 
-setup_logging("INFO")
+
+# Load the musical data using Music21
+# corpi = [os.path.join('./midi', f) for f in os.listdir('./midi') if f.endswith('.mid')]
+corpi = [c for c in music21.corpus.getComposer("mozart")[1:3]]
+
+notes = []
+ql_to_ordinal = {}
+ordinal_to_ql = {}
+for corpus in corpi:
+    logger.info(f'Parsing {corpus}')
+    parsed = music21.converter.parse(corpus)
+    elements = parsed.flat.notes
+    for element in elements:
+        if isinstance(element, music21.note.Note):
+            ql_to_ordinal[element.duration.quarterLength] = element.duration.ordinal
+            ordinal_to_ql[element.duration.ordinal] = element.duration.quarterLength
+            notes.append((element.pitch.pitchClass, element.pitch.octave, element.duration.ordinal))
+
+# Preprocess the data
+sequence_length = SEQUENCE_LENGTH
+n_samples = (len(notes) // BATCH_SIZE) * BATCH_SIZE
+notes = notes[:n_samples]
+num_features = len(notes[0])
+
+feature_classes_count = [max(np.max(notes, axis=0)[i] + 1 for notes in [notes]) for i in range(num_features)]
+features = [np.array([note[i] for note in notes]) for i in range(num_features)]
+Xs = [
+    np.zeros((len(notes) - sequence_length, sequence_length, feature_classes_count[i]), dtype=np.int32)
+    for i in range(num_features)]
+ys = [np.zeros((len(notes) - sequence_length, feature_classes_count[i]), dtype=np.int32) for i in range(num_features)]
+
+for i in range(num_features):
+    for j in range(len(notes) - sequence_length):
+        Xs[i][j] = to_categorical(features[i][j:j + sequence_length], num_classes=feature_classes_count[i])
+        ys[i][j] = to_categorical(features[i][j + sequence_length], num_classes=feature_classes_count[i])
+
+# Define the model architecture
+inputs = [Input(shape=(sequence_length, feature_classes_count[i])) for i in range(num_features)]
+merged = concatenate(inputs)
+
+lstm1 = LSTM(units=64, activation='tanh', return_sequences=True)(merged)
+lstm2 = LSTM(units=64)(lstm1)
+outputs = [Dense(feature_classes_count[i], activation='softmax', name=f'out{i}')(lstm2) for i in range(num_features)]
+
+model = Model(inputs=inputs, outputs=outputs)
+
+# Compile the model
+model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['categorical_accuracy'])
+
+# Train the model
+history = model.fit(Xs, ys, batch_size=BATCH_SIZE, epochs=EPOCHS, verbose=1)
 
 
-class Main:
-    def __init__(self, args):
-        self.args = args
+def predict_sequence(model, seed_sequence, sequence_length, num_features):
+    # Encode the seed sequence
+    seed_sequence = [seed_sequence[i][-sequence_length:] for i in range(num_features)]
+    seed_sequence = [to_categorical([seed_sequence[i]], num_classes=feature_classes_count[i]) for i in range(num_features)]
+    # Predict the next feature values in the sequence
+    predicted_features = model.predict(seed_sequence, verbose=0)
+    # Decode the predicted feature values
+    next_features = [np.argmax(predicted_features[i][0]) for i in range(num_features)]
 
-    def start(self):
-        logger.info("hello world")
-        logger.info(self.args)
-
-        # Load the musical data using Music21
-        corpus = music21.corpus.getComposer("bach")
-        notes = []
-
-        # for piece in corpus:
-        parsed = [music21.converter.parse(corpus[i]) for i in range(0,2)]
-        for part in parsed:
-            elements = part.flat.notes
-            for element in tqdm(elements):
-                if isinstance(element, music21.note.Note):
-                    # note = (element.pitch.midi, element.duration.quarterLength)
-                    # notes.append(note)
-                    notes.append(element.pitch.midi)
-
-        # Preprocess the data
-        X = []
-        y = []
-        sequence_length = 100
-        for i in tqdm(range(len(notes) - sequence_length)):
-            X.append(notes[i:i + sequence_length])
-            y.append(notes[i + sequence_length])
-
-        # Convert the data to numpy arrays
-        X = np.array(X)
-        y = np.array(y)
-
-        # load the model if exists saved
-        if os.path.exists('best_model.h5'):
-            model = keras.models.load_model('best_model.h5')
-        else:
-            # Define the model
-            model = Sequential()
-            model.add(LSTM(units=128, input_shape=(sequence_length, 1)))
-            model.add(Dense(units=128, activation='softmax'))
-
-        # Compile the model
-        model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
-
-        checkpoint = ModelCheckpoint(filepath='best_model.h5', monitor='loss', verbose=1, save_best_only=True, mode='min')
-
-        # Train the model
-        batch_size = 128
-        epochs = 500
-        model.fit(X, y, batch_size=batch_size, epochs=epochs, callbacks=[checkpoint])
-
-        # Generate music
-        start_note = np.zeros((1, sequence_length, 1))
-        start_note[0, -1, 0] = music21.note.Note('C4').pitch.midi
-        generated_notes = []
-        note = start_note
-        for i in range(100):
-            prediction = model.predict(note)
-            next_note = np.argmax(prediction)
-            generated_notes.append(next_note)
-            note[0, :-1, 0] = note[0, 1:, 0]
-            note[0, -1, 0] = music21.note.Note(pitch=music21.pitch.Pitch(next_note)).pitch.midi
-
-        # Convert the generated notes to a Music21 Stream
-        generated_stream = music21.stream.Stream()
-        for note in generated_notes:
-            generated_stream.append(music21.note.Note(pitch=music21.pitch.Pitch(note)))
-
-        # Write the generated stream to a MIDI file
-        generated_stream.write('midi', fp='generated_music.mid')
-
-        play_midi('generated_music.mid')
+    return next_features
 
 
-if __name__ == "__main__":
-    if platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    parser = argparse.ArgumentParser()
+def generate_song(model, seed_sequence, sequence_length, song_length, num_features):
+    song = [list(reversed(seed_sequence[i][:sequence_length])) for i in range(num_features)]
+    for i in range(song_length - sequence_length):
+        next_features = predict_sequence(model, song, sequence_length, num_features)
+        print(f"Predicted feature: {next_features}")
+        song = [np.append(song[i], next_features[i]) for i in range(num_features)]
+    return song
 
-    # # Required single positional argument
-    # parser.add_argument("arg",
-    #                     help="Required positional argument (a single thing).")
 
-    # # Required multime positional arguments
-    # parser.add_argument('items', nargs='+',
-    #                     help='Required various positional arguments (a list).')
+# Set the seed sequence and the desired length of the generated song
+seed_sequence = features
+song_length = 256
 
-    # Optional argument flag which defaults to False
-    parser.add_argument("-f", "--flag", action="store_true", default=False, help="Activate Flag (false by default)")
+# Generate the song
+song = generate_song(model, seed_sequence, sequence_length, song_length, num_features)
 
-    # Optional argument which requires a parameter (eg. -d test)
-    parser.add_argument("-n", "--name", action="store", dest="name", help="Specifies a name if necessary.")
+# Write the generated stream to a MIDI file
+stream = music21.stream.Stream()
 
-    # Optional extra verbosity level.
-    parser.add_argument("-v", "--verbose", action="store_const", default="INFO", const="DEBUG", help="Increases verbosity. Shows debugging log messages.")
+for (pitch, octave, duration) in zip(song[0], song[1], song[2]):
+    _pitch = music21.pitch.Pitch(pitch, octave=octave)
+    note = music21.note.Note(pitch=_pitch, duration=music21.duration.Duration(ordinal_to_ql[duration]))
+    stream.append(note)
 
-    args = parser.parse_args()
-    Main(args).start()
-    # asyncio.run(Main(args).start())
+stream.write('midi', fp='generated_music.mid')
+play_midi('generated_music.mid')
