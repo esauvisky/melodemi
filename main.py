@@ -134,7 +134,7 @@ dropout2 = Dropout(0.2)(gru2)
 outputs = [Dense(feature_classes_count[i], activation='softmax', name=f'out{i}')(dropout2) for i in range(NUM_FEATURES)]
 model = Model(inputs=inputs, outputs=outputs)
 model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['categorical_accuracy'])
-early_stopping = EarlyStopping(monitor='loss', patience=20, min_delta=0.00001)
+early_stopping = EarlyStopping(monitor='loss', patience=10)
 model_checkpoint = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True)
 
 # Split the data into training and validation sets
@@ -172,7 +172,7 @@ def plot_training_history(history):
 
     plt.show()
 
-plot_training_history(history)
+# plot_training_history(history)
 
 def predict_sequence(model, seed_sequence, num_features):
     slen = len(seed_sequence[0])
