@@ -13,7 +13,10 @@ from tqdm import tqdm
 
 SEQUENCE_LENGTH = 16
 BATCH_SIZE = 16
-EPOCHS = 100
+EPOCHS = 300
+QL_TO_ORDINAL = {}
+ORDINAL_TO_QL = {}
+
 
 
 def setup_logging(level="DEBUG", show_module=False):
@@ -28,30 +31,90 @@ def setup_logging(level="DEBUG", show_module=False):
     logger.add(sys.stderr, level=log_level, format=log_fmt, colorize=True, backtrace=True, diagnose=True)
 
 
-def play_midi(midi_file):
-    #Play MIDI
+def get_chord(note):
+    duration = music21.duration.Duration(ORDINAL_TO_QL[note[1]])
+    pitch_octave_pairs = [(note[i], note[i + 1]) for i in range(2, len(note), 2) if note[i] != 0 and note[i + 1] != 0]
+    pitches = [music21.pitch.Pitch(pitch, octave=octave) for pitch, octave in pitch_octave_pairs]
+
+    return music21.chord.Chord(pitches, duration=duration)
+
+
+def get_note(note):
+    duration = music21.duration.Duration(ORDINAL_TO_QL[note[1]])
+    pitch, octave = note[2] - 1, note[3]
+    pitch = music21.pitch.Pitch(pitch, octave=octave)
+
+    return music21.note.Note(pitch=pitch, duration=duration)
+
+
+def get_rest(note):
+    duration = music21.duration.Duration(ORDINAL_TO_QL[note[1]])
+
+    return music21.note.Rest(duration=duration)
+
+
+def play_song(song):
+    stream = music21.stream.Stream()
+    for note in song:
+        if note[0] == 1:   # Rest
+            stream.append(get_rest(note))
+        elif note[0] == 2: # Note
+            stream.append(get_note(note))
+        elif note[0] == 3: # Chord
+            stream.append(get_chord(note))
+
+    stream.write('midi', fp='generated_music.mid')
     sf2_path = '/usr/share/soundfonts/freepats-general-midi.sf2' # path to sound font file
-    FluidSynth(sound_font=sf2_path).play_midi(midi_file)
+    FluidSynth(sound_font=sf2_path).play_midi("generated_music.mid")
 
 
-# Load the musical data using Music21
+def parse_corpus(corpi):
+    notes = []
+    for corpus in corpi:
+        logger.info(f'Parsing {corpus}')
+        # sf2_path = '/usr/share/soundfonts/freepats-general-midi.sf2' # path to sound font file
+        # FluidSynth(sound_font=sf2_path).play_midi(corpus)
+        parsed = music21.converter.parse(corpus)
+        elements = parsed.flat.notesAndRests
+        for element in elements:
+            # duration = element.duration.fullName # too many different values
+            duration = element.duration.quarterLengthNoTuplets # less precise
+            if duration not in QL_TO_ORDINAL:
+                ordinal = len(QL_TO_ORDINAL) + 1
+                QL_TO_ORDINAL[duration] = ordinal
+                ORDINAL_TO_QL[ordinal] = duration
+            else:
+                ordinal = QL_TO_ORDINAL[duration]
+
+            if isinstance(element, music21.note.Rest):
+                feat = [1, ordinal]
+
+            if isinstance(element, music21.note.Note):
+                feat = [2, ordinal, element.pitch.pitchClass + 1, element.pitch.octave]
+
+            if isinstance(element, music21.chord.Chord):
+                chord_notes = []
+                for pitch in element.pitches:
+                    chord_notes = chord_notes + [pitch.pitchClass + 1, pitch.octave]
+                feat = [3, ordinal, *chord_notes]
+
+            notes.append(feat)
+
+    # ensures all notes are the same length by padding with zeros
+    max_len = max(len(note) for note in notes)
+    notes = [note + [0] * (max_len - len(note)) for note in notes]
+    return notes
+
+
+## Load the midi files
+# corpi = [c for c in music21.corpus.getComposer("mozart")[2:5]]
 # corpi = [os.path.join('./midi', f) for f in os.listdir('./midi') if f.endswith('.mid')]
-corpi = [c for c in music21.corpus.getComposer("mozart")[1:3]]
+# corpi = [os.path.join('./midi', f) for f in os.listdir('./midi') if f.endswith('.mid') and f.startswith("mid")][:20]
+# corpi = [os.path.join('./midi/pokemon', f) for f in os.listdir('./midi/pokemon')]
+corpi = ["./midi/pokemon/Pokemon_game_-_Pokemon.mid"]
+notes = parse_corpus(corpi)
 
-notes = []
-ql_to_ordinal = {}
-ordinal_to_ql = {}
-for corpus in corpi:
-    logger.info(f'Parsing {corpus}')
-    parsed = music21.converter.parse(corpus)
-    elements = parsed.flat.notes
-    for element in elements:
-        if isinstance(element, music21.note.Note):
-            ql_to_ordinal[element.duration.quarterLength] = element.duration.ordinal
-            ordinal_to_ql[element.duration.ordinal] = element.duration.quarterLength
-            notes.append((element.pitch.pitchClass, element.pitch.octave, element.duration.ordinal))
-
-# Preprocess the data
+## Preprocess the data
 sequence_length = SEQUENCE_LENGTH
 n_samples = (len(notes) // BATCH_SIZE) * BATCH_SIZE
 notes = notes[:n_samples]
@@ -83,7 +146,7 @@ model = Model(inputs=inputs, outputs=outputs)
 model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['categorical_accuracy'])
 
 # Train the model
-history = model.fit(Xs, ys, batch_size=BATCH_SIZE, epochs=EPOCHS, verbose=1)
+history = model.fit(Xs, ys, batch_size=BATCH_SIZE, epochs=EPOCHS, use_multiprocessing=True)
 
 
 def predict_sequence(model, seed_sequence, sequence_length, num_features):
@@ -99,7 +162,8 @@ def predict_sequence(model, seed_sequence, sequence_length, num_features):
 
 
 def generate_song(model, seed_sequence, sequence_length, song_length, num_features):
-    song = [list(reversed(seed_sequence[i][:sequence_length])) for i in range(num_features)]
+    # song = [list(reversed(seed_sequence[i][:sequence_length])) for i in range(num_features)]
+    song = [seed_sequence[i][:sequence_length] for i in range(num_features)]
     for i in range(song_length - sequence_length):
         next_features = predict_sequence(model, song, sequence_length, num_features)
         print(f"Predicted feature: {next_features}")
@@ -108,19 +172,10 @@ def generate_song(model, seed_sequence, sequence_length, song_length, num_featur
 
 
 # Set the seed sequence and the desired length of the generated song
-seed_sequence = features
-song_length = 256
+seed_sequence = [features[i][:SEQUENCE_LENGTH] for i in range(num_features)]
+song_length = 128
 
 # Generate the song
 song = generate_song(model, seed_sequence, sequence_length, song_length, num_features)
-
-# Write the generated stream to a MIDI file
-stream = music21.stream.Stream()
-
-for (pitch, octave, duration) in zip(song[0], song[1], song[2]):
-    _pitch = music21.pitch.Pitch(pitch, octave=octave)
-    note = music21.note.Note(pitch=_pitch, duration=music21.duration.Duration(ordinal_to_ql[duration]))
-    stream.append(note)
-
-stream.write('midi', fp='generated_music.mid')
-play_midi('generated_music.mid')
+song = np.transpose(song)
+play_song(song)
